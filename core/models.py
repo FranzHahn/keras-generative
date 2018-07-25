@@ -6,21 +6,14 @@ import queue
 import numpy as np
 import h5py
 
-import matplotlib
-
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-
-from keras.models import load_model
 from abc import ABCMeta, abstractmethod
 
-from models.utils import *
+from models.utils import print_current_progress, plot_metrics
 from core.losses import Loss
 import metrics
 
 try:
-    from core.notifyier import *
+    from core.notifyier import notify_with_message, notify_with_image
 except ImportError as e:
     print(repr(e))
     print("You did not set a notifyier. Notifications will not be sent anywhere")
@@ -45,6 +38,7 @@ class BaseModel(metaclass=ABCMeta):
         self.n_losses = len(self.loss_names)
 
         self.current_epoch = 0
+        self.current_fract_epoch = 0.
         self.run_id = kwargs.get('run_id', 0)
         self.name = "{}_r{}".format(self.name, self.run_id)
 
@@ -60,7 +54,7 @@ class BaseModel(metaclass=ABCMeta):
         self.label_smoothing = kwargs.get('label_smoothing', 0.0)
         self.input_noise = kwargs.get('input_noise', 0.0)
 
-        self.checkpoint_every = kwargs.get('checkpoint_every', 1)
+        self.checkpoint_every = kwargs.get('checkpoint_every', "1")
         self.notify_every = kwargs.get('notify_every', self.checkpoint_every)
         self.lr = kwargs.get('lr', 1e-4)
         self.z_dims = kwargs.get('z_dims', 100)
@@ -108,8 +102,20 @@ class BaseModel(metaclass=ABCMeta):
         Main learning loop
         '''
 
+        # convert checkpoints to img-processed counts if not already
+        # floats are interpreted as epoch fractions
+        try:
+            self.checkpoint_every = int(self.checkpoint_every)
+            self.notify_every = int(self.notify_every)
+        except ValueError:
+            self.checkpoint_every = int(float(self.checkpoint_every)*len(dataset))
+            self.notify_every = int(float(self.notify_every)*len(dataset))
+
+
         # Create output directories if not exist
         self.dataset = dataset
+        self.batchsize = batchsize
+        self.processed_images = 0
         out_dir = os.path.join(self.output, self.experiment_id)
         if not os.path.isdir(out_dir):
             os.mkdir(out_dir)
@@ -128,28 +134,22 @@ class BaseModel(metaclass=ABCMeta):
 
         # Start training
         print('\n\n--- START TRAINING ---\n')
-        num_data = len(dataset)
-        self.batchsize = batchsize
         for e in range(self.last_epoch, epochs):
-            perm = np.random.permutation(num_data)
             start_time = time.time()
             self.current_epoch = e + 1
-            for b in range(0, num_data, batchsize):
-
-                # account for division of data into batch size
-                if batchsize > num_data - b:
-                    continue
-                bsize = batchsize
-                indx = perm[b:b + bsize]
-
-                # slice batch out of dataset
-                x_batch, y_batch = self.make_batch(dataset, indx)
+            for x_batch, y_batch, batch_index in dataset.generator(batchsize=self.batchsize):
 
                 # finally, train and report status
                 losses = self.train_on_batch(x_batch, y_batch=y_batch)
                 self.update_loss_history(losses)
+                self.processed_images += self.batchsize
+                self.current_fract_epoch = e + self.processed_images/len(self.dataset)
 
-                print_current_progress(e, b, bsize, len(dataset), self.losses, elapsed_time=time.time() - start_time)
+                print_current_progress(e, batch_index,
+                                       batch_size=self.batchsize,
+                                       dataset_length=len(self.dataset),
+                                       losses=self.losses,
+                                       elapsed_time=time.time() - start_time)
 
                 # check for collapse scenario where G and D losses are equal
                 did_collapse = self.did_collapse(losses)
@@ -166,32 +166,29 @@ class BaseModel(metaclass=ABCMeta):
                     print('\nFinish testing: %s' % self.experiment_id)
                     return
 
-            print()
-            # plot samples and losses and send notification if it's checkpoint time
-            if ((self.current_epoch) % self.checkpoint_every) == 0:
-                self.save_model(self.wgt_out_dir, self.current_epoch)
-            if ((self.current_epoch) % self.notify_every) == 0:
-                self.send_metrics_notification()
+                # plot samples and losses and send notification if it's checkpoint time
+                if self.processed_images % self.checkpoint_every < (self.processed_images-self.batchsize) % self.checkpoint_every:
+                    self.save_model(self.wgt_out_dir, self.processed_images)
+                if self.processed_images % self.notify_every < (self.processed_images-self.batchsize) % self.notify_every:
+                    self.send_metrics_notification()
+
+                self.update_loss_weights()
 
             elapsed_time = time.time() - start_time
             print('Took: {}s\n'.format(elapsed_time))
             self.did_train_over_an_epoch()
-            self.update_loss_weights()
 
     def update_loss_weights(self):
-        log_message = "New loss weights: "
         weight_delta = 0.
         for l, loss in self.losses.items():
-            new_loss, delta = loss.update_weight_based_on_time(self.current_epoch)
-            log_message = "{}{}:{}, ".format(log_message, l, new_loss)
+            new_loss, delta = loss.update_weight_based_on_time(self.current_fract_epoch)
             weight_delta = np.max((weight_delta, delta))
 
         if weight_delta > 0.1:
             for l in self.losses.values():
                 l.reset_weight_from_last_significant_change()
             self.reset_optimizers()
-            log_message = "{}. Did reset optmizers".format(log_message)
-        print(log_message)
+            print("[TRAINING] Did reset optmizers.")
 
     def reset_optimizers(self):
         if self.opt_states is None:
@@ -203,15 +200,7 @@ class BaseModel(metaclass=ABCMeta):
 
     def update_loss_history(self, new_losses):
         for l, loss in self.losses.items():
-            loss.update_history(new_losses[l]/self.batchsize)
-
-    def make_batch(self, dataset, indx):
-        '''
-        Get batch from dataset
-        '''
-        data = dataset.images[indx]
-        labels = dataset.attrs[indx]
-        return data, labels
+            loss.update_history(new_losses[l] / self.batchsize)
 
     def did_collapse(self, losses):
         return False
@@ -254,13 +243,6 @@ class BaseModel(metaclass=ABCMeta):
         '''
         pass
 
-    def predict_images(self, z_sample):
-        images = self.predict(z_sample)
-        if images.shape[3] == 1:
-            images = np.squeeze(imgs, axis=(3,))
-        # images = np.clip(predictions * 0.5 + 0.5, 0.0, 1.0)
-        return images
-
     def gather_data_for_metric(self, data_type):
         data = self.load_precomputed_features_if_they_exist(data_type)
         if not data:
@@ -273,7 +255,7 @@ class BaseModel(metaclass=ABCMeta):
         return data
 
     def compute_all_metrics(self):
-        log_message = "Metrics for Epoch #{}: ".format(np.max((self.current_epoch - self.notify_every, 1)))
+        log_message = "[Metrics] Image #{} Epoch #{:04.2}: ".format(self.processed_images, self.current_fract_epoch)
         for m, metric in self.metrics.items():
             input_data = self.gather_data_for_metric(metric.input_type)
             metric.compute_in_parallel(input_data)
@@ -341,7 +323,7 @@ class BaseModel(metaclass=ABCMeta):
     def load_precomputed_features_if_they_exist(self, feature_type, has_labels=True):
         filename = os.path.join(
             self.tmp_out_dir,
-            "precomputed_{}_e{}.h5".format(feature_type, self.current_epoch))
+            "precomputed_{}_pi{}.h5".format(feature_type, self.processed_images))
         if os.path.exists(filename):
             with h5py.File(filename, 'r') as hf:
                 x = hf['feats'][:]
@@ -357,7 +339,7 @@ class BaseModel(metaclass=ABCMeta):
         start = time.time()
         filename = os.path.join(
             self.tmp_out_dir,
-            "precomputed_{}_e{}.h5".format(feature_type, self.current_epoch))
+            "precomputed_{}_pi{}.h5".format(feature_type, self.processed_images))
         with h5py.File(filename, 'w') as hf:
             hf.create_dataset("feats",  data=X)
             if Y is not None:
@@ -365,12 +347,12 @@ class BaseModel(metaclass=ABCMeta):
         print("[Precalc] Saving {} took {}s".format(feature_type, time.time() - start))
 
     def send_metrics_notification(self):
-        outfile = os.path.join(self.res_out_dir, "epoch_{:04}_metrics.png".format(self.current_epoch))
+        outfile = os.path.join(self.res_out_dir, "pi_{:04}_metrics.png".format(self.processed_images))
         log_message = self.compute_all_metrics()
         did_plot = self.plot_all_metrics(outfile)
         print(log_message)
         try:
-            message = "[{}] Epoch #{:04}".format(self.experiment_id, self.current_epoch)
+            message = "[{}] ProcImgs #{:04} Epoch #{:04.2}".format(self.experiment_id, self.processed_images, self.current_fract_epoch)
             notify_with_message(log_message, self.experiment_id)
             if did_plot:
                 notify_with_image(outfile, experiment_id=self.experiment_id, message=message)

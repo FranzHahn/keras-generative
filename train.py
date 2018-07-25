@@ -1,19 +1,11 @@
 import os
-import sys
-import math
 import argparse
 
 from keras import backend as K
-import numpy as np
-from sklearn.preprocessing import LabelBinarizer
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-
-import matplotlib
-matplotlib.use('Agg')
-
 import models
 from datasets import load_dataset
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 
 def main():
@@ -33,8 +25,8 @@ def main():
     parser.add_argument('--label-smoothing', default=0.0, type=float)
     parser.add_argument('--input-noise', default=0.0, type=float)
     parser.add_argument('--run-id', '-r', required=True)
-    parser.add_argument('--checkpoint-every', default=1, type=int)
-    parser.add_argument('--notify-every', default=1, type=int)
+    parser.add_argument('--checkpoint-every', default='1.', type=str)
+    parser.add_argument('--notify-every', default='1.', type=str)
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--dis-loss-control', default=1., type=float)
     parser.add_argument('--triplet-weight', default=1., type=float)
